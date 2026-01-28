@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+ECHO MINI V3.1.0 Font Extraction Script
+
+Based on discovered Part 5 mapping rules:
+- param_c = byte offset within table (not character position!)
+- unicode_start = Unicode value of character at that offset
+- Mapping is sparse, only covers specific characters
+
+Output directory structure:
+- small/: Non-drift tables (0x20-0x3F, 32-byte spacing)
+- large/: Drift tables (0x43-0x4C, 0x4F-0x54, 33-byte spacing)
+
+File naming format: 0xTT_OOOO.bmp (TT=table index, OOOO=offset within table)
+- With mapping: suffix +U+XXXX (e.g., 0x43_0BEC+U+4E2D.bmp)
+- Without mapping: just 0xTT_OOOO.bmp (e.g., 0x43_0BEC.bmp)
+"""
+
+import os
+import sys
+import json
+import struct
+from pathlib import Path
+from collections import defaultdict
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+FIXED_FW_PATH = "HIFIEC10_Fixed.bin"
+PART5_PATH = "extracted_parts/part_5_main_fs.bin"
+OUTPUT_DIR = "extracted_parts/fonts_correct"
+SMALL_DIR = os.path.join(OUTPUT_DIR, "small")  # Non-drift tables (32-byte spacing)
+LARGE_DIR = os.path.join(OUTPUT_DIR, "large")  # Drift tables (33-byte spacing)
+
+# Font table parameters
+CHAR_SIZE = 32        # Bytes per character (16x16 pixels, 2 bytes per row)
+CHAR_WIDTH = 16       # Character width in pixels
+CHAR_HEIGHT = 16      # Character height in pixels
+TABLE_BASE_OFFSET = 0x09C4  # Start offset of font data within each table
+
+# Part 5 mapping table location
+PART5_MAPPING_OFFSET = 0x6A5  # Where mapping table starts in part_5_main_fs.bin
+PART5_ENTRY_SIZE = 16        # Size of each mapping entry in bytes
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def ensure_dir(path):
+    """Create directory if it doesn't exist."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+def escape_filename(name):
+    """Make filename safe for all filesystems by replacing problematic characters."""
+    safe = "".join(c if c.isalnum() or c in '-._' else '_' for c in name)
+    return safe
+
+def apply_display_transform(rows):
+    """
+    Apply display transformation (only for tables 0x40-0x5F):
+    1. Right circular shift by 3 columns
+    2. Down circular shift by 1 row
+    
+    Args:
+        rows (list): List of strings representing character rows
+        
+    Returns:
+        list: Transformed rows
+    """
+    # Step 1: Shift each row right by 3 columns
+    rows_shifted_right = []
+    for row in rows:
+        # Circular shift: last 3 chars move to front
+        shifted = row[-3:] + row[:-3]
+        rows_shifted_right.append(shifted)
+    
+    # Step 2: Shift entire character down by 1 row
+    rows_transformed = rows_shifted_right[-1:] + rows_shifted_right[:-1]
+    
+    return rows_transformed
+
+def extract_char_bitmap(data, offset, table_idx):
+    """
+    Extract a single 16x16 character bitmap from firmware data.
+    
+    Args:
+        data (bytes): Complete firmware data
+        offset (int): Offset within data where character starts
+        table_idx (int): Table index (for logging/debugging)
+        
+    Returns:
+        list or None: List of strings representing character rows, or None if extraction failed
+    """
+    # Check bounds
+    if offset + CHAR_SIZE > len(data):
+        return None
+    
+    # Extract character data (32 bytes = 16 rows × 2 bytes per row)
+    char_data = data[offset:offset + CHAR_SIZE]
+    
+    rows = []
+    for row in range(CHAR_HEIGHT):
+        # Each row uses 2 bytes
+        odd = char_data[row * 2]       # Bits 8-15 (stored first)
+        even = char_data[row * 2 + 1]  # Bits 0-7 (stored second)
+        
+        # Bit mapping: positions 0-7 from even byte, positions 8-15 from odd byte
+        row_pixels = []
+        
+        # Process even byte: bit 7 → position 0, ..., bit 0 → position 7
+        for i in range(7, -1, -1):
+            row_pixels.append('#' if (even >> i) & 1 else '.')
+        
+        # Process odd byte: bit 7 → position 8, ..., bit 0 → position 15
+        for i in range(7, -1, -1):
+            row_pixels.append('#' if (odd >> i) & 1 else '.')
+        
+        rows.append(''.join(row_pixels))
+    
+    # Based on analysis, we only use first 15 columns
+    rows = [row[:15] for row in rows]
+    
+    return rows
+
+def get_char_density(rows):
+    """Calculate pixel density of a character."""
+    if not rows:
+        return 0
+    return sum(row.count('#') for row in rows)
+
+def create_bmp_16x16(rows):
+    """
+    Create BMP file data for 15x16 grayscale image.
+    
+    Args:
+        rows (list): Character rows as strings ('#' for pixel, '.' for background)
+        
+    Returns:
+        bytes: Complete BMP file data
+    """
+    width = 15          # We only use first 15 columns
+    height = len(rows)  # Should be 16
+    
+    # BMP requires rows to be 4-byte aligned
+    # For 15 pixels at 8-bit depth: 15 bytes + 1 padding byte = 16 bytes per row
+    row_size = ((width + 3) // 4) * 4
+    
+    # Calculate sizes
+    pixel_data_offset = 14 + 40 + 256 * 4  # File header + info header + color table
+    pixel_data_size = row_size * height
+    file_size = pixel_data_offset + pixel_data_size
+    
+    bmp_data = bytearray()
+    
+    # BITMAPFILEHEADER (14 bytes)
+    bmp_data += b'BM'                           # Signature
+    bmp_data += file_size.to_bytes(4, 'little')  # File size
+    bmp_data += b'\x00\x00\x00\x00'            # Reserved
+    bmp_data += pixel_data_offset.to_bytes(4, 'little')  # Pixel data offset
+    
+    # BITMAPINFOHEADER (40 bytes)
+    bmp_data += (40).to_bytes(4, 'little')      # Header size
+    bmp_data += width.to_bytes(4, 'little')     # Width
+    bmp_data += height.to_bytes(4, 'little')    # Height
+    bmp_data += (1).to_bytes(2, 'little')       # Planes (must be 1)
+    bmp_data += (8).to_bytes(2, 'little')       # Bits per pixel (8-bit grayscale)
+    bmp_data += b'\x00\x00\x00\x00'            # Compression (none)
+    bmp_data += pixel_data_size.to_bytes(4, 'little')  # Image size
+    bmp_data += b'\x00\x00\x00\x00'            # Horizontal resolution
+    bmp_data += b'\x00\x00\x00\x00'            # Vertical resolution
+    bmp_data += (256).to_bytes(4, 'little')    # Colors in palette
+    bmp_data += b'\x00\x00\x00\x00'            # Important colors
+    
+    # Color table (256 grayscale entries, 4 bytes each: B, G, R, 0)
+    for i in range(256):
+        bmp_data += bytes([i, i, i, 0])
+    
+    # Pixel data (stored bottom-up with row padding)
+    for row in reversed(rows):
+        # Convert each character to pixel value
+        for char in row:
+            bmp_data += bytes([255 if char == '#' else 0])  # White pixel for '#', black for '.'
+        
+        # Add padding bytes to align to 4-byte boundary
+        padding = row_size - width
+        if padding > 0:
+            bmp_data += b'\x00' * padding
+    
+    return bytes(bmp_data)
+
+# ============================================================================
+# Part 5 Mapping Table Parsing
+# ============================================================================
+
+def parse_part5_mapping(part5_data):
+    """
+    Parse Part 5 font mapping table.
+    
+    Format discovered: sparse mapping of byte offsets to Unicode values.
+    
+    Args:
+        part5_data (bytes): Content of part_5_main_fs.bin
+        
+    Returns:
+        dict: Mapping of (table_idx, param_c) → unicode_value
+              where param_c is byte offset within table
+    """
+    mapping = {}  # (table_idx, param_c) -> unicode_value
+    
+    offset = PART5_MAPPING_OFFSET
+    
+    # Parse entries until end of data or reasonable limit
+    while offset + PART5_ENTRY_SIZE <= len(part5_data):
+        entry_data = part5_data[offset:offset + PART5_ENTRY_SIZE]
+        
+        # Parse entry fields (little-endian format)
+        unicode_start = struct.unpack('<I', entry_data[0:4])[0] & 0xFFFFFF
+        size_flags = entry_data[3]
+        table_info = struct.unpack('<I', entry_data[4:8])[0]
+        table_index = entry_data[7]
+        param_c = struct.unpack('<H', entry_data[8:10])[0]  # Byte offset within table
+        param_d = struct.unpack('<H', entry_data[10:12])[0]
+        
+        # Validate and save mapping
+        MAX_UNICODE = 0x10FFFF
+        if unicode_start != 0 and table_index != 0 and unicode_start <= MAX_UNICODE:
+            mapping[(table_index, param_c)] = unicode_start
+        
+        # Move to next entry
+        offset += PART5_ENTRY_SIZE
+        
+        # Safety limits to prevent infinite loops
+        if offset > 0x200000 or len(mapping) > 100000:
+            break
+    
+    return mapping
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+import shutil
+
+def clear_directory(path):
+    """Completely clear directory if it exists, then create it."""
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    ensure_dir(path)
+
+def main():
+    # Check required files exist
+    if not os.path.exists(FIXED_FW_PATH):
+        print(f"Error: Cannot find firmware file {FIXED_FW_PATH}")
+        sys.exit(1)
+    
+    if not os.path.exists(PART5_PATH):
+        print(f"Error: Cannot find Part 5 file {PART5_PATH}")
+        sys.exit(1)
+    
+    # Clear and create output directories
+    print(f"[*] Clearing output directories...")
+    clear_directory(SMALL_DIR)
+    clear_directory(LARGE_DIR)
+    
+    # Read Part 5 mapping data
+    print(f"[*] Reading Part 5 mapping table: {PART5_PATH}")
+    with open(PART5_PATH, 'rb') as f:
+        part5_data = f.read()
+    
+    mapping = parse_part5_mapping(part5_data)
+    print(f"    Parsed {len(mapping)} mapping entries")
+    
+    # Read firmware file
+    print()
+    print(f"[*] Reading firmware: {FIXED_FW_PATH}")
+    with open(FIXED_FW_PATH, 'rb') as f:
+        firmware_data = f.read()
+    
+    print(f"    Firmware size: {len(firmware_data)} bytes")
+    print()
+    
+    # Extract font tables 0x20-0x5F
+    print(f"[*] Extracting font tables 0x20-0x5F...")
+    print("=" * 80)
+    
+    tables = []        # Store table metadata
+    total_chars = 0    # Total characters extracted
+    total_mapped = 0   # Characters with Unicode mapping
+    
+    # Process each table index from 0x20 to 0x5F
+    for table_idx in range(0x20, 0x60):
+        # Calculate table addresses
+        table_head_base = table_idx << 16              # Table header address
+        table_base_addr = (table_idx << 16) | TABLE_BASE_OFFSET  # Font data base address
+        
+        # Skip if table is beyond firmware bounds
+        if table_base_addr >= len(firmware_data):
+            continue
+        
+        # Note: Header check disabled because some tables (e.g., 0x42)
+        # may have empty headers but contain data in other areas
+        
+        # Determine if this is a drift table
+        # Drift tables use 33-byte spacing, non-drift use 32-byte spacing
+        is_drift = (0x40 <= table_idx <= 0x4C) or (0x4F <= table_idx <= 0x54)
+        output_dir = LARGE_DIR if is_drift else SMALL_DIR
+        drift_mark = " [Drift Table]" if is_drift else ""
+        
+        char_files = []      # Files extracted from this table
+        mapped_count = 0     # Mapped characters in this table
+        
+        # Extract mapped characters first (from Part 5 mapping)
+        # For each table, find all mappings where table_index matches
+        mapped_offsets = {}
+        for (tbl_idx, param_c), unicode_value in mapping.items():
+            if tbl_idx == table_idx:
+                mapped_offsets[param_c] = unicode_value
+        
+        # Process mapped characters
+        for param_c, unicode_value in sorted(mapped_offsets.items()):
+            # Calculate actual file offset
+            actual_offset = table_base_addr + param_c
+            
+            # Calculate offset from table head (for filename)
+            offset_from_head = param_c + TABLE_BASE_OFFSET
+            
+            # Check bounds
+            if actual_offset + CHAR_SIZE > len(firmware_data):
+                continue
+            
+            # Extract character bitmap
+            rows = extract_char_bitmap(firmware_data, actual_offset, table_idx)
+            if rows is None:
+                continue
+            
+            # Check if character has any pixels
+            density = get_char_density(rows)
+            if density == 0:
+                continue
+            
+            # Create filename with Unicode information
+            filename = f"0x{table_idx:02X}_{offset_from_head:04X}+U{unicode_value:04X}.bmp"
+            filepath = os.path.join(output_dir, filename)
+            
+            # Create BMP and save
+            bmp_data = create_bmp_16x16(rows)
+            with open(filepath, 'wb') as f:
+                f.write(bmp_data)
+            
+            # Record file metadata
+            char_files.append({
+                'filename': filename,
+                'table_idx': table_idx,
+                'offset_from_head': offset_from_head,
+                'unicode': unicode_value,
+                'density': density,
+            })
+            
+            total_chars += 1
+            mapped_count += 1
+        
+        # Scan for additional unmapped characters
+        # Calculate maximum data size for this table
+        table_data_size = min(65536, len(firmware_data) - table_head_base)
+        
+        # Determine scanning parameters based on table type
+        if is_drift:
+            scan_interval = 33  # Drift tables use 33-byte spacing
+            # Drift tables have formula-based starting offset
+            scan_start = 2 * (table_idx % 33) + 8
+        else:
+            scan_interval = 32  # Non-drift tables use 32-byte spacing
+            scan_start = 0x0000  # Start from table header
+        
+        # Scan through table for potential characters
+        for offset_from_head in range(scan_start, table_data_size - CHAR_SIZE, scan_interval):
+            # Convert to relative offset for checking mapped_offsets
+            char_offset = offset_from_head - TABLE_BASE_OFFSET
+            
+            # Skip already mapped positions
+            if char_offset in mapped_offsets:
+                continue
+            
+            # Calculate actual file offset
+            actual_offset = table_head_base + offset_from_head
+            
+            # Check bounds
+            if actual_offset < 0 or actual_offset + CHAR_SIZE > len(firmware_data):
+                continue
+            
+            # Extract character bitmap
+            rows = extract_char_bitmap(firmware_data, actual_offset, table_idx)
+            if rows is None:
+                continue
+            
+            # Check if character has any pixels
+            density = get_char_density(rows)
+            if density == 0:
+                continue
+            
+            # Create filename without Unicode information
+            filename = f"0x{table_idx:02X}_{offset_from_head:04X}.bmp"
+            filepath = os.path.join(output_dir, filename)
+            
+            # Create BMP and save
+            bmp_data = create_bmp_16x16(rows)
+            with open(filepath, 'wb') as f:
+                f.write(bmp_data)
+            
+            # Record file metadata
+            char_files.append({
+                'filename': filename,
+                'table_idx': table_idx,
+                'offset_from_head': offset_from_head,
+                'unicode': None,
+                'density': density,
+            })
+            
+            total_chars += 1
+        
+        # Report progress for this table
+        print(f"[{table_idx-0x20+1}/48] Table 0x{table_idx:02X}{drift_mark} - "
+              f"Extracted {len(char_files)} characters ({mapped_count} with Unicode mapping)")
+        total_mapped += mapped_count
+        
+        # Store table metadata
+        tables.append({
+            'index': table_idx,
+            'offset_hex': f"0x{table_base_addr:08X}",
+            'is_drift': is_drift,
+            'char_count': len(char_files),
+            'mapped_count': mapped_count,
+            'char_files': char_files,
+        })
+    
+    # Calculate statistics
+    small_count = sum(t['char_count'] for t in tables if not t['is_drift'])
+    large_count = sum(t['char_count'] for t in tables if t['is_drift'])
+    
+    # Create comprehensive manifest
+    manifest = {
+        'firmware_file': FIXED_FW_PATH,
+        'part5_file': PART5_PATH,
+        'extraction_time': __import__('datetime').datetime.now().isoformat(),
+        'directories': {
+            'small': SMALL_DIR,
+            'large': LARGE_DIR,
+        },
+        'tables': tables,
+        'summary': {
+            'total_tables': len(tables),
+            'total_chars': total_chars,
+            'total_mapped': total_mapped,
+            'unmapped': total_chars - total_mapped,
+            'small_chars': small_count,
+            'large_chars': large_count,
+        },
+        'notes': [
+            'Part 5 mapping rule: param_c = byte offset within table',
+            'Output directory: small/ (non-drift tables, 32-byte spacing)',
+            'Output directory: large/ (drift tables, 33-byte spacing)',
+            'File naming: 0xTT_OOOO[+U+XXXX].bmp',
+            f'Mapping coverage: {total_mapped}/{total_chars} = {100*total_mapped/total_chars:.1f}%',
+        ],
+    }
+    
+    # Save manifest
+    manifest_file = os.path.join(OUTPUT_DIR, "MANIFEST.json")
+    with open(manifest_file, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    
+    # Display summary
+    print()
+    print("Extraction Complete!")
+    print(f"  Output directories:")
+    print(f"    {SMALL_DIR}/ (non-drift tables): {small_count:5d} characters")
+    print(f"    {LARGE_DIR}/ (drift tables):     {large_count:5d} characters")
+    print(" ")
+    print(f"  Total tables: {len(tables):3d}")
+    print(f"  Total characters: {total_chars:5d} (mapped: {total_mapped:5d}, unmapped: {total_chars-total_mapped:5d})")
+
+if __name__ == "__main__":
+    main()
