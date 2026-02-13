@@ -11,7 +11,7 @@ Current
 
 Previous
 
-<img width="800" height="450" alt="image" src="https://github.com/user-attachments/assets/dd8776ae-a1ad-4286-875b-f7d3e888be2b" />
+<img width="320" height="170" alt="image" src="https://github.com/user-attachments/assets/dd8776ae-a1ad-4286-875b-f7d3e888be2b" />
 
 Current
 
