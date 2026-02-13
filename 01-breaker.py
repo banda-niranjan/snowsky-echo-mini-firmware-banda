@@ -10,7 +10,7 @@ import os
 import sys
 
 # Configuration constants
-FILE_NAME = 'HIFIEC10.IMG'                    # Name of the firmware image file
+FILE_NAME = 'HIFIEC20.IMG'                    # Name of the firmware image file
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Script's directory
 FILE_PATH = os.path.join(BASE_DIR, FILE_NAME)          # Full path to firmware image
 OUTPUT_DIR = os.path.join(BASE_DIR, 'extracted_parts') # Directory for extracted files
